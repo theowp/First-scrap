@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""
+Scraper Interpol Red Notices - Version Onyxia:
+- Optimisé pour l'environnement Onyxia
+- Requêtes via urllib (lib standard)
+- Nettoyage texte via BeautifulSoup4
+- Pagination page=1..N
+- Dédoublonnage par entity_id puis URL
+- Enrichissement des infractions via l'URL de détail
+- CSV UTF-8 en sortie
+- Stratégie intelligente par pays avec division récursive
+
+Variables d'environnement utiles:
+  SCRAPER_UA
+  SCRAPER_REFERER
+  SCRAPER_COOKIE           (copier/coller le cookie complet depuis DevTools → Network)
+  SCRAPER_DELAY            (ex: 0.8)
+  SCRAPER_RESULT_PER_PAGE  (ex: 160)
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import math
+from typing import Dict, Any, List, Optional, Iterable, Set
+from urllib.request import Request, urlopen
+import ssl
+from urllib.parse import urlencode
+
+from bs4 import BeautifulSoup
+
+API_URL = "https://ws-public.interpol.int/notices/v1/red"
+
+RESULTS_PER_PAGE = int(os.getenv("SCRAPER_RESULT_PER_PAGE") or "160")
+DELAY = float(os.getenv("SCRAPER_DELAY") or "0.8")
+
+# En-têtes optimisés pour Onyxia
+HEADERS = {
+    "accept": "*/*",
+    "accept-language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "origin": "https://www.interpol.int",
+    "priority": "u=1, i",
+    "referer": "https://www.interpol.int/",
+    "sec-ch-ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+}
+if os.getenv("SCRAPER_COOKIE"):
+    HEADERS["cookie"] = os.getenv("SCRAPER_COOKIE").strip()
+
+
+def http_get_json(url: str, params: Optional[Dict[str, str]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """GET JSON avec urllib (lib standard)."""
+    if params:
+        url = f"{url}?{urlencode(params)}"
+    req = Request(url, headers=(headers or HEADERS))
+    # SSL context: par défaut vérifie les certificats; si SCRAPER_INSECURE=1, on désactive la vérification
+    ctx: Optional[ssl.SSLContext] = None
+    if os.getenv("SCRAPER_INSECURE") == "1":
+        ctx = ssl._create_unverified_context()
+    with urlopen(req, timeout=30, context=ctx) as resp:
+        data = resp.read().decode("utf-8", errors="replace")
+    try:
+        return json.loads(data)
+    except Exception:
+        return {}
+
+
+def clean_text(text: str) -> str:
+    """Nettoie un texte avec BeautifulSoup: supprime balises/entités, normalise espaces."""
+    if not text:
+        return ""
+    soup = BeautifulSoup(f"<div>{text}</div>", "html.parser")
+    cleaned = soup.get_text(separator=" ")
+    return " ".join(cleaned.split())
+
+
+def classify_infraction(text: str) -> str:
+    """Classifie une infraction selon les mots-clés français fournis."""
+    if not text:
+        return ""
+    
+    text_lower = text.lower()
+    
+    # Mots-clés de classification avec leurs variantes
+    classifications = {
+        "Corruption": ["corruption", "corrupt", "bribery", "bribe", "kickback", "fraud", "fraude"],
+        "Contrefaçon de la monnaie et des documents": ["counterfeit", "counterfeiting", "fake", "faux", "forgery", "falsification", "document", "money", "currency", "monnaie"],
+        "Crimes contre les enfants": ["child", "children", "minor", "minors", "pedophile", "pedophilia", "sexual abuse", "abuse", "exploitation", "enfant", "mineur"],
+        "Crime du patrimoine culturel": ["cultural", "heritage", "antiquity", "art", "patrimoine", "culturel", "archaeological", "archéologique"],
+        "Cybercriminalité": ["cyber", "computer", "hacking", "malware", "phishing", "digital", "internet", "online", "cybercrime", "informatique"],
+        "Trafic de drogue": ["drug", "drugs", "narcotic", "narcotics", "cocaine", "heroin", "marijuana", "cannabis", "trafficking", "trafic", "drogue"],
+        "Crime environnemental": ["environmental", "pollution", "wildlife", "animal", "nature", "environment", "écologie", "environnemental", "logging", "forest", "illegal logging", "deforestation"],
+        "Crime financier": ["financial", "money laundering", "laundering", "tax evasion", "evasion", "financial crime", "financier", "blanchiment"],
+        "Trafic d'armes à feu": ["weapon", "weapons", "firearm", "gun", "arms", "trafficking", "trafic", "arme", "armes"],
+        "Trafic d'êtres humains et contrebande de migrants": ["human trafficking", "trafficking", "smuggling", "migrant", "migration", "human", "trafic humain", "migrant"],
+        "Marchandises illicites": ["illicit", "contraband", "smuggling", "goods", "merchandise", "illicite", "contrebande"],
+        "Crime maritime": ["maritime", "piracy", "piracy", "sea", "ocean", "ship", "vessel", "maritime", "piraterie"],
+        "Crime organisé": ["organized crime", "organized", "mafia", "gang", "syndicate", "crime organisé", "organisation criminelle"],
+        "Terrorisme": ["terrorism", "terrorist", "terror", "bomb", "explosive", "terrorisme", "terroriste"],
+        "Crime de véhicule": ["vehicle", "car", "auto", "theft", "stealing", "robbery", "véhicule", "vol"],
+        "Crimes de guerre": ["war crime", "war", "genocide", "crimes against humanity", "crimes de guerre", "génocide"],
+        "Crimes violents": ["murder", "homicide", "killing", "death", "assault", "violence", "rape", "sexual assault", "meurtre", "homicide", "agression", "viol"],
+        "Autres crimes": []  # Catégorie filet de sécurité pour toutes les autres infractions
+    }
+    
+    # Chercher la correspondance la plus probable
+    for category, keywords in classifications.items():
+        if category == "Autres crimes":
+            continue  # Skip cette catégorie dans la recherche normale
+        for keyword in keywords:
+            if keyword in text_lower:
+                return category
+    
+    # Si aucune correspondance trouvée, retourner "Autres crimes"
+    return "Autres crimes"
+
+
+def extract_age_from_dob(dob: str) -> str:
+    """
+    dob attendu au format YYYY-MM-DD (ou proche).
+    On calcule l'âge à partir de l'année si plausible.
+    """
+    if not dob or len(dob) < 4 or not dob[:4].isdigit():
+        return ""
+    try:
+        from datetime import datetime
+        year = int(dob[:4])
+        age = datetime.now().year - year
+        return str(age) if 0 <= age <= 120 else ""
+    except Exception:
+        return ""
+
+
+def iter_notices(data: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    emb = data.get("_embedded", {})
+    if isinstance(emb, dict):
+        arr = emb.get("notices", [])
+        if isinstance(arr, list):
+            for item in arr:
+                if isinstance(item, dict):
+                    yield item
+
+
+def extract_infractions(obj: Optional[Dict[str, Any]]) -> List[str]:
+    """Récupère 'charge' / 'charges' / 'charge_translation' dans arrest_warrants et classe selon les mots-clés français."""
+    out: List[str] = []
+    if not obj:
+        return out
+    aws = obj.get("arrest_warrants")
+    if not isinstance(aws, list):
+        return out
+    for aw in aws:
+        if not isinstance(aw, dict):
+            continue
+        # charge
+        ch = aw.get("charge")
+        if ch:
+            classified = classify_infraction(str(ch))
+            if classified and classified not in out:
+                out.append(classified)
+        # charges (liste)
+        chs = aw.get("charges")
+        if isinstance(chs, list):
+            for c in chs:
+                classified = classify_infraction(str(c))
+                if classified and classified not in out:
+                    out.append(classified)
+        # charge_translation (optionnel)
+        tr = aw.get("charge_translation")
+        if tr:
+            classified = classify_infraction(str(tr))
+            if classified and classified not in out:
+                out.append(classified)
+    return out
+
+
+def fetch_detail(url: str) -> Optional[Dict[str, Any]]:
+    """Appelle l'URL de détail JSON d'une notice (self.href)."""
+    if not url:
+        return None
+    try:
+        time.sleep(0.1)  # Petit délai pour éviter le rate limiting
+        data = http_get_json(url, headers=HEADERS)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def fetch_detail_by_entity_id(entity_id: str) -> Optional[Dict[str, Any]]:
+    """Récupère les détails d'une notice par son entity_id."""
+    if not entity_id:
+        return None
+    
+    # Construire l'URL de détail avec l'entity_id
+    detail_url = f"https://ws-public.interpol.int/notices/v1/red/{entity_id}"
+    
+    try:
+        time.sleep(0.1)  # Petit délai pour éviter le rate limiting
+        data = http_get_json(detail_url, headers=HEADERS)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def normalize_notice(raw: Dict[str, Any], detail: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    # Identity particulars
+    name = clean_text(str(raw.get("name") or ""))
+    forename = clean_text(str(raw.get("forename") or ""))
+    dob = str(raw.get("date_of_birth") or "").strip()
+    age = extract_age_from_dob(dob)
+    
+    # Récupérer le sexe depuis les détails si pas disponible dans raw
+    sex = clean_text(str(raw.get("sex_id") or raw.get("sex") or ""))
+    if not sex and detail:
+        sex = clean_text(str(detail.get("sex_id") or detail.get("sex") or ""))
+
+    # Place of birth - récupérer depuis raw puis detail
+    place_of_birth = clean_text(str(raw.get("place_of_birth") or ""))
+    if not place_of_birth and detail:
+        place_of_birth = clean_text(str(detail.get("place_of_birth") or ""))
+
+    # Physical description - récupérer depuis detail
+    height = clean_text(str(detail.get("height") or "")) if detail else ""
+    weight = clean_text(str(detail.get("weight") or "")) if detail else ""
+    hair_color = clean_text(str(detail.get("hair_color") or "")) if detail else ""
+    eye_color = clean_text(str(detail.get("eye_color") or "")) if detail else ""
+    
+    # Languages - récupérer depuis detail
+    languages = ""
+    if detail and detail.get("languages_spoken"):
+        languages = ", ".join([clean_text(lang) for lang in detail.get("languages_spoken")])
+
+    # nationalities: garder la première si liste, sinon concaténer proprement
+    nat = ""
+    nats = raw.get("nationalities")
+    if isinstance(nats, list):
+        if nats:
+            nat = clean_text(str(nats[0]))
+        else:
+            nat = ""
+    elif nats:
+        nat = clean_text(str(nats))
+    else:
+        nat = ""
+
+    entity_id = str(raw.get("entity_id") or raw.get("id") or "").strip()
+    notice_id = str(raw.get("notice_id") or "").strip()
+
+    # URL de la notice
+    url = ""
+    links = raw.get("_links")
+    if isinstance(links, dict):
+        sl = links.get("self")
+        if isinstance(sl, dict):
+            url = str(sl.get("href") or "").strip()
+        elif isinstance(sl, str):
+            url = sl.strip()
+
+    # Pays émetteur du mandat
+    warrant_country = ""
+    for source in (raw, detail):
+        if isinstance(source, dict):
+            aws = source.get("arrest_warrants")
+            if isinstance(aws, list):
+                for aw in aws:
+                    if isinstance(aw, dict):
+                        wc = aw.get("issuing_country_id") or aw.get("issuing_country")
+                        if wc:
+                            warrant_country = clean_text(str(wc))
+                            break
+        if warrant_country:
+            break
+
+    # Infractions fusionnées liste + détail
+    infractions: List[str] = []
+    infractions += extract_infractions(raw)
+    infractions += extract_infractions(detail)
+    # dédoublonnage en préservant l'ordre
+    seen: Set[str] = set()
+    infractions = [x for x in infractions if not (x in seen or seen.add(x))]
+    infractions_joined = " | ".join(infractions)
+
+    return {
+        "name": name,
+        "forename": forename,
+        "age": age,
+        "sex": sex,
+        "place_of_birth": place_of_birth,
+        "nationality": nat,
+        "height": height,
+        "weight": weight,
+        "hair_color": hair_color,
+        "eye_color": eye_color,
+        "languages": languages,
+        "entity_id": entity_id,
+        "notice_id": notice_id,
+        "warrant_country": warrant_country,
+        "url": url,
+        "infractions": infractions_joined,
+    }
+
+
+def fetch_page(page: int) -> Dict[str, Any]:
+    """Récupère une page JSON (liste)."""
+    params = {
+        "page": str(page),
+        "resultPerPage": str(RESULTS_PER_PAGE),
+    }
+    return http_get_json(API_URL, params=params, headers=HEADERS)
+
+
+def fetch_page_with_filters(page: int,
+                            nationality: Optional[str] = None,
+                            age_min: Optional[int] = None,
+                            age_max: Optional[int] = None,
+                            sex_id: Optional[str] = None) -> Dict[str, Any]:
+    """Récupère une page JSON avec filtres par nationalité, âge et genre."""
+    params = {
+        "page": str(page),
+        "resultPerPage": str(RESULTS_PER_PAGE),
+    }
+    if nationality:
+        params["nationality"] = nationality
+    if age_min is not None:
+        params["ageMin"] = str(age_min)
+    if age_max is not None:
+        params["ageMax"] = str(age_max)
+    if sex_id:
+        params["sexId"] = sex_id
+    return http_get_json(API_URL, params=params, headers=HEADERS)
+
+
+def get_total_with_filters(nationality: Optional[str] = None,
+                           age_min: Optional[int] = None,
+                           age_max: Optional[int] = None,
+                           sex_id: Optional[str] = None) -> int:
+    """Récupère le total avec filtres."""
+    try:
+        data = fetch_page_with_filters(1, nationality, age_min, age_max, sex_id)
+        if not data:  # Si l'API retourne une erreur 403 ou autre
+            return 0
+        total = int(data.get("total", 0))
+        if total <= 0:
+            notices = list(iter_notices(data))
+            total = len(notices)
+        return total
+    except Exception as e:
+        print(f"[Debug] Erreur get_total_with_filters: {e}")
+        return 0
+
+
+def fetch_all_pages_for_filters(nationality: Optional[str], age_min: Optional[int], age_max: Optional[int],
+                               sex_id: Optional[str], seen_ids: Set[str], delay: float) -> List[Dict[str, str]]:
+    """Récupère toutes les pages pour une combinaison de filtres (pays, tranche d'âge, genre)."""
+    rows: List[Dict[str, str]] = []
+    
+    # Vérifier le total d'abord
+    total = get_total_with_filters(nationality, age_min, age_max, sex_id)
+    if total == 0:
+        return rows
+    
+    num_pages = math.ceil(total / RESULTS_PER_PAGE)
+    print(f"[Info] {nationality or 'ALL'} age[{age_min or 0}-{age_max or 120}] sex[{sex_id or 'ALL'}]: total={total}, pages={num_pages}")
+    
+    for page in range(1, num_pages + 1):
+        if page > 1:
+            time.sleep(delay)
+        
+        data = fetch_page_with_filters(page, nationality, age_min, age_max, sex_id)
+        notices = list(iter_notices(data))
+        print(f"[Info] page {page}/{num_pages}: {len(notices)} notices")
+        
+        for item in notices:
+            # Clé de dédup: entity_id > url > fallback
+            eid = str(item.get("entity_id") or item.get("id") or "").strip()
+            
+            nurl = ""
+            links = item.get("_links")
+            if isinstance(links, dict):
+                sl = links.get("self")
+                if isinstance(sl, dict):
+                    nurl = str(sl.get("href") or "").strip()
+                elif isinstance(sl, str):
+                    nurl = sl.strip()
+            
+            # Clé de dédup robuste : entity_id > notice_id > url > fallback unique
+            key = eid
+            if not key:
+                notice_id = str(item.get("notice_id") or "").strip()
+                key = notice_id
+            if not key:
+                key = nurl
+            if not key:
+                # Fallback avec données uniques (sans paramètres de requête)
+                name = str(item.get('name', '')).strip()
+                forename = str(item.get('forename', '')).strip()
+                dob = str(item.get('date_of_birth', '')).strip()
+                sex = str(item.get('sex_id', '')).strip()
+                key = f"{name}|{forename}|{dob}|{sex}"
+            
+            if key in seen_ids:
+                print(f"[Debug] Notice déjà vue: {key[:50]}...")
+                continue
+            seen_ids.add(key)
+            
+            # Détail - essayer d'abord par URL, puis par entity_id
+            detail = None
+            if nurl:
+                detail = fetch_detail(nurl)
+            elif eid:
+                detail = fetch_detail_by_entity_id(eid)
+            
+            row = normalize_notice(item, detail)
+            rows.append(row)
+    
+    return rows
+
+
+def recursive_age_split(country: str, sex_id: Optional[str], age_min: int, age_max: int, seen_ids: Set[str], delay: float, depth: int = 0) -> List[Dict[str, str]]:
+    """Division récursive des plages d'âge : si ≥160, divise par 2"""
+    all_rows: List[Dict[str, str]] = []
+    
+    # Protection contre les boucles infinies sur Onyxia
+    MAX_DEPTH = 10
+    if depth > MAX_DEPTH:
+        print(f"[Warn] {country} sex[{sex_id or 'ALL'}] age[{age_min}-{age_max}]: profondeur maximale atteinte ({MAX_DEPTH}), arrêt")
+        return all_rows
+    
+    # Test de la plage actuelle
+    total = get_total_with_filters(country, age_min, age_max, sex_id)
+    print(f"[Info] {country} sex[{sex_id or 'ALL'}] age[{age_min}-{age_max}]: total={total}")
+    
+    if total == 0:
+        return all_rows
+
+    # Cas "plafond suspect" - continuer à splitter
+    if total >= 160 and (age_max - age_min) > 0:
+        mid = (age_min + age_max) // 2
+        print(f"[Info] {country} sex[{sex_id or 'ALL'}] age[{age_min}-{age_max}]: ≥160, division en [{age_min}-{mid}] et [{mid+1}-{age_max}]")
+        rows1 = recursive_age_split(country, sex_id, age_min, mid, seen_ids, delay, depth + 1)
+        rows2 = recursive_age_split(country, sex_id, mid + 1, age_max, seen_ids, delay, depth + 1)
+        all_rows.extend(rows1)
+        all_rows.extend(rows2)
+        return all_rows
+
+    # Granularité minimale avec total >= 160
+    if (age_max - age_min) <= 1 and total >= 160:
+        if sex_id is None:
+            # Ajoute split par sexe
+            print(f"[Info] {country} age[{age_min}-{age_max}]: granularité minimale ≥160, split par sexe")
+            for sx in ["M", "F", "U"]:
+                all_rows.extend(recursive_age_split(country, sx, age_min, age_max, seen_ids, delay, depth + 1))
+            return all_rows
+        
+        # Tentative alpha-split avant collecte forcée
+        print(f"[Info] {country} sex[{sex_id}] age[{age_min}-{age_max}]: tentative alpha-split")
+        alpha_rows = fetch_with_alpha_split(country, age_min, age_max, sex_id, seen_ids, delay)
+        if alpha_rows:
+            print(f"[Alpha] {len(alpha_rows)} rows via alpha-split")
+            return alpha_rows
+        
+        # Fallback: collecte simple (peut être tronquée)
+        print(f"[Warn] {country} sex[{sex_id}] age[{age_min}-{age_max}]: collecte forcée (peut être tronquée)")
+        all_rows.extend(fetch_all_pages_for_filters(country, age_min, age_max, sex_id, seen_ids, delay))
+        return all_rows
+
+    # total < 160 → collecte directe
+    print(f"[Info] {country} sex[{sex_id or 'ALL'}] age[{age_min}-{age_max}]: <160, récupération directe")
+    all_rows.extend(fetch_all_pages_for_filters(country, age_min, age_max, sex_id, seen_ids, delay))
+    return all_rows
+
+
+def fetch_with_alpha_split(country: str, age_min: Optional[int], age_max: Optional[int], sex_id: Optional[str], seen_ids: Set[str], delay: float) -> List[Dict[str, str]]:
+    """Filet de sécurité : filtrage par initiale de l'alphabet A-Z"""
+    all_rows: List[Dict[str, str]] = []
+    alphabet = [chr(c) for c in range(ord('A'), ord('Z')+1)]
+    
+    print(f"[Alpha] Test alpha-split pour {country} age[{age_min}-{age_max}] sex[{sex_id or 'ALL'}]")
+    
+    for letter in alphabet:
+        try:
+            # Test avec filtre par initiale du nom
+            total_alpha = get_total_with_alpha(country, age_min, age_max, sex_id, letter)
+            print(f"[Alpha] {country} '{letter}': total={total_alpha}")
+            
+            if total_alpha == 0:
+                continue
+            elif total_alpha <= 160:
+                # Collecte directe avec filtre alphabétique
+                rows = fetch_all_pages_with_alpha(country, age_min, age_max, sex_id, letter, seen_ids, delay)
+                all_rows.extend(rows)
+            else:
+                # Si encore >160, diviser l'alphabet en groupes
+                print(f"[Alpha] {country} '{letter}': >160, division alphabétique")
+                # Diviser A-Z en groupes plus petits
+                alpha_groups = [list("ABCDEFGH"), list("IJKLMN"), list("OPQRST"), list("UVWXYZ")]
+                for group in alpha_groups:
+                    if letter in group:
+                        for group_letter in group:
+                            group_total = get_total_with_alpha(country, age_min, age_max, sex_id, group_letter)
+                            if group_total > 0:
+                                print(f"[Alpha] {country} '{group_letter}': total={group_total}")
+                                rows = fetch_all_pages_with_alpha(country, age_min, age_max, sex_id, group_letter, seen_ids, delay)
+                                all_rows.extend(rows)
+                        break
+        except Exception as e:
+            print(f"[Alpha] Erreur pour '{letter}': {e}")
+            continue
+    
+    return all_rows
+
+
+def get_total_with_alpha(country: str, age_min: Optional[int], age_max: Optional[int], sex_id: Optional[str], letter: str) -> int:
+    """Teste le total avec un filtre alphabétique"""
+    params = {
+        "page": "1",
+        "resultPerPage": str(RESULTS_PER_PAGE),
+        "nationality": country,
+        "name": letter
+    }
+    if age_min is not None:
+        params["ageMin"] = str(age_min)
+    if age_max is not None:
+        params["ageMax"] = str(age_max)
+    if sex_id:
+        params["sexId"] = sex_id
+    
+    try:
+        data = http_get_json(API_URL, params=params, headers=HEADERS)
+        return int(data.get("total", 0))
+    except Exception:
+        return 0
+
+
+def fetch_all_pages_with_alpha(country: str, age_min: Optional[int], age_max: Optional[int], sex_id: Optional[str], letter: str, seen_ids: Set[str], delay: float) -> List[Dict[str, str]]:
+    """Récupère toutes les pages avec filtre alphabétique"""
+    rows: List[Dict[str, str]] = []
+    
+    # Vérifier le total d'abord
+    total = get_total_with_alpha(country, age_min, age_max, sex_id, letter)
+    if total == 0:
+        return rows
+    
+    num_pages = math.ceil(total / RESULTS_PER_PAGE)
+    print(f"[Alpha] {country} '{letter}' age[{age_min or 0}-{age_max or 120}] sex[{sex_id or 'ALL'}]: total={total}, pages={num_pages}")
+    
+    for page in range(1, num_pages + 1):
+        if page > 1:
+            time.sleep(delay)
+        
+        params = {
+            "page": str(page),
+            "resultPerPage": str(RESULTS_PER_PAGE),
+            "nationality": country,
+            "name": letter
+        }
+        if age_min is not None:
+            params["ageMin"] = str(age_min)
+        if age_max is not None:
+            params["ageMax"] = str(age_max)
+        if sex_id:
+            params["sexId"] = sex_id
+        
+        data = http_get_json(API_URL, params=params, headers=HEADERS)
+        notices = list(iter_notices(data))
+        print(f"[Alpha] page {page}/{num_pages}: {len(notices)} notices")
+        
+        for item in notices:
+            # Clé de dédup: entity_id > url > fallback
+            eid = str(item.get("entity_id") or item.get("id") or "").strip()
+            
+            nurl = ""
+            links = item.get("_links")
+            if isinstance(links, dict):
+                sl = links.get("self")
+                if isinstance(sl, dict):
+                    nurl = str(sl.get("href") or "").strip()
+                elif isinstance(sl, str):
+                    nurl = sl.strip()
+            
+            # Clé de dédup robuste : entity_id > notice_id > url > fallback unique
+            key = eid
+            if not key:
+                notice_id = str(item.get("notice_id") or "").strip()
+                key = notice_id
+            if not key:
+                key = nurl
+            if not key:
+                # Fallback avec données uniques (sans paramètres de requête)
+                name = str(item.get('name', '')).strip()
+                forename = str(item.get('forename', '')).strip()
+                dob = str(item.get('date_of_birth', '')).strip()
+                sex = str(item.get('sex_id', '')).strip()
+                key = f"{name}|{forename}|{dob}|{sex}"
+            
+            if key in seen_ids:
+                print(f"[Debug] Notice déjà vue: {key[:50]}...")
+                continue
+            seen_ids.add(key)
+            
+            # Détail - essayer d'abord par URL, puis par entity_id
+            detail = None
+            if nurl:
+                detail = fetch_detail(nurl)
+            elif eid:
+                detail = fetch_detail_by_entity_id(eid)
+            
+            row = normalize_notice(item, detail)
+            rows.append(row)
+    
+    return rows
+
+
+def smart_fetch_country(country: str, seen_ids: Set[str], delay: float) -> List[Dict[str, str]]:
+    """Logique intelligente avec division récursive et filet alphabétique"""
+    all_rows: List[Dict[str, str]] = []
+    country_start_count = len(seen_ids)  # Compteur au début du pays
+    
+    try:
+        # 1. Test du pays seul
+        total_country = get_total_with_filters(country)
+        print(f"[Info] {country}: total={total_country}")
+        
+        # Si l'API ne répond pas (erreur 403), arrêter immédiatement
+        if total_country == 0:
+            print(f"[Info] {country}: Aucune donnée disponible (API bloquée)")
+            return all_rows
+        
+        if total_country <= 160:
+            # Pays seul suffit
+            print(f"[Info] {country}: ≤160, récupération directe")
+            rows = fetch_all_pages_for_filters(country, None, None, None, seen_ids, delay)
+            all_rows.extend(rows)
+        else:
+            # 2. Pays >160, tester par genre
+            print(f"[Info] {country}: >160, test par genre")
+            sex_ids = ["M", "F", "U"]
+            
+            for sex_id in sex_ids:
+                total_sex = get_total_with_filters(country, None, None, sex_id)
+                print(f"[Info] {country} sex[{sex_id}]: total={total_sex}")
+                
+                # Si l'API ne répond pas pour ce genre, passer au suivant
+                if total_sex == 0:
+                    print(f"[Info] {country} sex[{sex_id}]: Aucune donnée disponible, passage au suivant")
+                    continue
+                
+                if total_sex <= 160:
+                    # Genre seul suffit
+                    print(f"[Info] {country} sex[{sex_id}]: ≤160, récupération directe")
+                    rows = fetch_all_pages_for_filters(country, None, None, sex_id, seen_ids, delay)
+                    all_rows.extend(rows)
+                else:
+                    # Genre >160, utiliser division récursive des âges
+                    print(f"[Info] {country} sex[{sex_id}]: >160, division récursive des âges")
+                    rows = recursive_age_split(country, sex_id, 0, 120, seen_ids, delay, 0)
+                    all_rows.extend(rows)
+        
+        # Validation de complétude
+        country_end_count = len(seen_ids)
+        country_collected = country_end_count - country_start_count
+        print(f"[Info] {country}: collected={country_collected}, expected={total_country}")
+        
+        if country_collected < total_country:
+            print(f"[Warn] {country}: collected < expected! Différence: {total_country - country_collected}")
+    
+    except Exception as e:
+        print(f"[Erreur] {country}: {e}")
+        return all_rows
+    
+    return all_rows
+
+
+def run(max_pages: Optional[int], output_csv: str, delay: float) -> None:
+    all_rows: List[Dict[str, str]] = []
+    seen_ids: Set[str] = set()   # entity_id / url / fallback key
+    
+    # Liste complète des pays pour scraping complet
+    countries = [
+        "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT", "AU", "AW", "AX", "AZ",
+        "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS", "BT", "BV", "BW", "BY", "BZ",
+        "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN", "CO", "CR", "CU", "CV", "CW", "CX", "CY", "CZ",
+        "DE", "DJ", "DK", "DM", "DO", "DZ",
+        "EC", "EE", "EG", "EH", "ER", "ES", "ET", "FI", "FJ", "FK", "FM", "FO", "FR",
+        "GA", "GB", "GD", "GE", "GF", "GG", "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS", "GT", "GU", "GW", "GY",
+        "HK", "HM", "HN", "HR", "HT", "HU", "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT",
+        "JE", "JM", "JO", "JP", "KE", "KG", "KH", "KI", "KM", "KN", "KP", "KR", "KW", "KY", "KZ",
+        "LA", "LB", "LC", "LI", "LK", "LR", "LS", "LT", "LU", "LV", "LY",
+        "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK", "ML", "MM", "MN", "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ",
+        "NA", "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU", "NZ",
+        "OM", "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY",
+        "QA", "RE", "RO", "RS", "RU", "RW", "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS", "ST", "SV", "SX", "SY", "SZ",
+        "TC", "TD", "TF", "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO", "TR", "TT", "TV", "TW", "TZ",
+        "UA", "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI", "VN", "VU", "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW"
+    ]
+    
+    print(f"[Info] Début du scraping intelligent par pays")
+    print(f"[Info] Pays à traiter: {len(countries)}")
+    print(f"[Info] Logique: pays seul → genre si >160 → division récursive des âges → alpha-split si nécessaire")
+    
+    total_countries = len(countries)
+    for i, country in enumerate(countries, 1):
+        print(f"\n[Info] Pays {i}/{total_countries}: {country}")
+        
+        try:
+            rows = smart_fetch_country(country, seen_ids, delay)
+            all_rows.extend(rows)
+            print(f"[Info] {country}: +{len(rows)} notices (total: {len(all_rows)})")
+            
+            # Si on a atteint la limite de pages, arrêter
+            if max_pages and len(all_rows) >= max_pages * RESULTS_PER_PAGE:
+                print(f"[Info] Limite atteinte: {max_pages * RESULTS_PER_PAGE} notices")
+                break
+                
+        except Exception as e:
+            print(f"[Erreur] {country}: {e}")
+            continue
+        
+        # Pause entre les pays
+        if i < total_countries:
+            time.sleep(delay * 2)
+    
+    # Écriture CSV avec toutes les nouvelles colonnes
+    fieldnames = ["name", "forename", "age", "sex", "place_of_birth", "nationality",
+                  "height", "weight", "hair_color", "eye_color", "languages",
+                  "entity_id", "notice_id", "warrant_country", "url", "infractions"]
+
+    with open(output_csv, "w", encoding="utf-8", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=fieldnames)
+        wr.writeheader()
+        for r in all_rows:
+            wr.writerow({k: r.get(k, "") for k in fieldnames})
+
+    print(f"\n[OK] {len(all_rows)} notices écrites dans {output_csv}")
+
+
+def main(argv: List[str]) -> int:
+    import argparse
+    p = argparse.ArgumentParser("Interpol Red Notices - Version Onyxia")
+    p.add_argument("--max-pages", type=int, default=None, help="Limiter le nombre de pages (debug)")
+    p.add_argument("--delay", type=float, default=DELAY, help="Délai entre appels (s)")
+    p.add_argument("--output", type=str, default="interpol_red_notices_onyxia.csv", help="CSV de sortie")
+    args = p.parse_args(argv[1:])
+
+    print("🚀 SCRAPER INTERPOL RED NOTICES - VERSION ONYXIA")
+    print("=" * 50)
+    print("Configuration:")
+    print(f"  resultPerPage={RESULTS_PER_PAGE}")
+    print(f"  delay={args.delay}s")
+    print(f"  output={args.output}")
+
+    run(max_pages=args.max_pages, output_csv=args.output, delay=args.delay)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
